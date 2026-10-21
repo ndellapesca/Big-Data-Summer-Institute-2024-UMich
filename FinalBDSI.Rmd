@@ -1,0 +1,429 @@
+---
+title: "Final"
+output: html_document
+date: "2024-07-19"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/Desktop")
+library(readr)
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(Matching)
+library(MatchIt)
+library(dplyr)
+library(glmnet)
+library(Boruta)
+library(tidyverse)
+library(cobalt)
+library(readr)
+```
+
+```{r}
+imp_data <- read_csv("Desktop/bestImputedData.csv")
+View(bestImputedData)
+```
+
+```{r}
+data_no_mort <- subset(imp_data, select = -c(mort_28_day))
+#Lasso
+x <- as.matrix(data_no_mort)
+y <- imp_data$mort_28_day
+
+lasso_model <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+best_lambda <- lasso_model$lambda.min
+
+final_lasso_model <- glmnet(x, y, family = "binomial", alpha = 1, lambda = best_lambda)
+
+coef(final_lasso_model)
+
+```
+```{r}
+which(final_lasso_model$beta!=0)
+tmp_coeffs <- coef(final_lasso_model, s = "lambda.min")
+great <- data.frame(name = tmp_coeffs@Dimnames[[1]][tmp_coeffs@i + 1], coefficient = tmp_coeffs@x)
+
+```
+
+
+```{r}
+#formula taken from significant lasso
+mort_28_day ~ age + echo + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy
+
+formula <- as.formula(mort_28_day ~ age + echo + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy + weight + vent + vaso)
+                      
+```
+
+```{r}
+#Prediction Model
+library(randomForest)
+set.seed(1287)
+imp_data$mort_28_day <- as.factor(imp_data$mort_28_day)
+
+train_index <- createDataPartition(imp_data$mort_28_day, p = 0.6, list = FALSE)
+data_train <- imp_data[train_index, ]
+data_test <- imp_data[-train_index, ]
+
+random_forest_model <- randomForest(formula, data = data_train, importance = TRUE, ntree = 500)
+
+predicted_probabilities_test <- predict(random_forest_model, newdata = data_test, type = "prob")
+threshold <- 0.3
+predicted_classes_test <- ifelse(predicted_probabilities_test[, "1"] > threshold, "1", "0")
+
+
+data_test$mort_28_day <- as.factor(data_test$mort_28_day)
+
+
+predicted_classes_test <- factor(predicted_classes_test, levels = levels(data_test$mort_28_day))
+
+
+confusion_matrix_test <- confusionMatrix(predicted_classes_test, data_test$mort_28_day)
+print(confusion_matrix_test)
+
+
+accuracy_test <- confusion_matrix_test$overall['Accuracy']
+print(paste("Accuracy on test set:", accuracy_test))
+```
+
+```{r}
+#Direct Estimate Random Forest
+set.seed(1287)
+
+imp_data$mort_28_day <- as.factor(imp_data$mort_28_day)
+
+split <- sample.split(imp_data$mort_28_day, SplitRatio = 0.6)
+split
+data_train <- subset(imp_data, split == "TRUE")
+data_test <- subset(imp_data, split == "FALSE")
+
+
+
+random_forest_model <- randomForest(formula,
+                                    data = data_train, importance = TRUE, ntree = 2000)
+
+# Predicting E[Y|X,W=w] for w in {0, 1} on the test data
+data_test_treat <- data_test
+data_test_treat$echo <- 1
+
+data_test_ctrl <- data_test
+data_test_ctrl$echo <- 0
+
+muhat.treat <- predict(random_forest_model, newdata = data_test_treat, type = "prob")[, "1"]
+muhat.ctrl <- predict(random_forest_model, newdata = data_test_ctrl, type = "prob")[, "1"]
+
+ate.est <- mean(muhat.treat) - mean(muhat.ctrl)
+
+print(ate.est)
+t.test(muhat.treat, muhat.ctrl)
+```
+
+```{r}
+#Bootstrapped Direct Esimtate w/ Ranom Forest
+num_bootstrap <- 500  #
+
+
+ate_estimates <- numeric(num_bootstrap)
+
+
+for (i in 1:num_bootstrap) {
+
+  boot_index <- sample(nrow(imp_data), replace = TRUE)
+  data_boot <- imp_data[boot_index, ]
+  
+
+  train_index_boot <- createDataPartition(data_boot$mort_28_day, p = 0.6, list = FALSE)
+  data_train_boot <- data_boot[train_index_boot, ]
+  data_test_boot <- data_boot[-train_index_boot, ]
+  
+
+  random_forest_model_boot <- randomForest(formula,
+                                          data = data_train_boot, ntree = 500)
+  
+
+  data_test_treat_boot <- data_test_boot
+  data_test_treat_boot$echo <- 1
+  
+  data_test_ctrl_boot <- data_test_boot
+  data_test_ctrl_boot$echo <- 0
+  
+  muhat.treat_boot <- predict(random_forest_model_boot, newdata = data_test_treat_boot, type = "prob")[, "1"]
+  muhat.ctrl_boot <- predict(random_forest_model_boot, newdata = data_test_ctrl_boot, type = "prob")[, "1"]
+  
+
+  ate_est_boot <- mean(muhat.treat_boot) - mean(muhat.ctrl_boot)
+  
+
+  ate_estimates[i] <- ate_est_boot
+}
+
+
+se_ate <- sd(ate_estimates)
+
+
+ci_95 <- quantile(ate_estimates, c(0.025, 0.975))
+
+
+mean_ate <- mean(ate_estimates)
+
+
+
+cat("Mean ATE:", mean_ate, "\n")
+cat("Standard error of ATE estimates:", se_ate, "\n")
+cat("95% Confidence Interval for ATE:", ci_95[1], "to", ci_95[2], "\n")
+
+```
+```{r}
+#Difference in Means
+DIM_treatment <- imp_data%>%
+  filter(echo == 1)
+mean(DIM_treatment$mort_28_day)
+ 
+DIM_control <- imp_data %>%
+  filter(echo == 0)
+mean(DIM_control$mort_28_day) 
+
+class(DIM_treatment$mort_28_day)
+
+DIM_treatment$mort_28_day <- as.character(DIM_treatment$mort_28_day)
+DIM_treatment$mort_28_day <- as.numeric(DIM_treatment$mort_28_day)
+DIM_treatment %>%
+  summarise(mean_mort_28_day = mean(mort_28_day, na.rm = TRUE))
+
+DIM_control$mort_28_day <- as.character(DIM_control$mort_28_day)
+DIM_control$mort_28_day <- as.numeric(DIM_control$mort_28_day)
+DIM_control %>%
+  summarise(mean_mort_28_day = mean(mort_28_day, na.rm = TRUE))
+
+DIM_treatment$mort_28_day <- as.numeric(DIM_treatment$mort_28_day)
+mean(DIM_treatment$mort_28_day)
+
+DIM_control$mort_28_day <- as.numeric(DIM_control$mort_28_day)
+mean(DIM_control$mort_28_day)
+
+t.test(DIM_treatment$mort_28_day, DIM_control$mort_28_day)
+
+mean(DIM_treatment$mort_28_day) - mean(DIM_control$mort_28_day)
+
+
+
+```
+
+```{r}
+#Propensity Score Model
+prop_rf <- randomForest(echo ~ age + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy,
+                        data = data_train, ntree = 2000, maxnodes = 7, importance = TRUE)
+
+head(prop_rf)
+
+prop_score <- predict(prop_rf, data_test)
+
+data_test <- cbind(data_test, prop_score)
+```
+```{r}
+#Love Plot
+library(cobalt)
+install.packages("WeightIt")
+library(WeightIt)
+w.out1 <- WeightIt::weightit(echo ~ age + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy,
+    data = imp_data, estimand = "ATE", method = "ps")
+
+set.cobalt.options(binary = "std")
+
+love.plot(w.out1, colors = list(unadjusted = "orange", adjusted = "blue"))
+```
+
+```{r}
+#Odds Ratio
+log_model <- glm(formula, data = imp_data, family = binomial)
+coef_summary <- summary(log_model)$coefficients
+odds_ratio <- exp(coef_summary["echo", "Estimate"])
+lower_ci <- exp(coef_summary["echo", "Estimate"] - 1.96 * coef_summary["echo", "Std. Error"])
+upper_ci <- exp(coef_summary["echo", "Estimate"] + 1.96 * coef_summary["echo", "Std. Error"])
+
+odds_ratio
+lower_ci
+upper_ci
+
+#Odds Ratio: 0.75, (0.656, 0.857)
+#EValue: (1.58 for point estimate, 1.37 worst case scenario)
+```
+```{r}
+#Sensitivity Analysis w/ Linear Regression
+library(sensemakr)
+imp_data$mort_28_day <- as.character(imp_data$mort_28_day)
+imp_data$mort_28_day <- as.numeric(imp_data$mort_28_day)
+
+model_lm <- lm(formula, data = imp_data)
+
+summary(model_lm)
+
+sensitivity <- sensemakr(model = model_lm, 
+                         # causal model
+                         treatment = "echo", 
+                         #treatment variable
+                         benchmark_covariates = c("sofa"), 
+                         # variables to bound the strength of unobs confounder
+                         kd = 1:3)
+
+plot(sensitivity)
+plot(sensitivity, sensitivity.of = "t-value")
+plot(sensitivity, type = "extreme")
+plot(sensitivity, sensitivity.of = "t-value")
+```
+```{r}
+#Variable Importance for Random Forest Model
+
+set.seed(1287)
+
+imp_data$mort_28_day <- as.factor(imp_data$mort_28_day)
+
+train_index <- createDataPartition(imp_data$mort_28_day, p = 0.6, list = FALSE)
+data_train <- imp_data[train_index, ]
+data_test <- imp_data[-train_index, ]
+
+
+train_control <- trainControl(method = "none")
+model <- train(formula,
+               data = data_train,
+               method = "rf",
+               trControl = train_control,
+               importance = TRUE,
+               ntree = 2000)
+
+# Predicting E[Y|X,W=w] for w in {0, 1} on the test data
+data_test_treat <- data_test
+data_test_treat$echo <- 1
+
+data_test_ctrl <- data_test
+data_test_ctrl$echo <- 0
+
+muhat.treat <- predict(model, newdata = data_test_treat, type = "prob")[, "1"]
+muhat.ctrl <- predict(model, newdata = data_test_ctrl, type = "prob")[, "1"]
+
+ate.est <- mean(muhat.treat) - mean(muhat.ctrl)
+
+
+varImp <- varImp(model)
+print(varImp)
+
+
+plot(varImp, main = "Variable Importance for Random Forest Model")
+
+print(ate.est)
+```
+
+```{r}
+#Bootstrapped Direct Esimtate w/ Ranom Forest
+num_bootstrap <- 500  #
+
+
+ate_estimates <- numeric(num_bootstrap)
+
+
+for (i in 1:num_bootstrap) {
+
+  boot_index <- sample(nrow(imp_data), replace = TRUE)
+  data_boot <- imp_data[boot_index, ]
+ 
+
+  train_index_boot <- createDataPartition(data_boot$mort_28_day, p = 0.6, list = FALSE)
+  data_train_boot <- data_boot[train_index_boot, ]
+  data_test_boot <- data_boot[-train_index_boot, ]
+ 
+
+  random_forest_model_boot <- randomForest(formula,
+                                          data = data_train_boot, ntree = 2000)
+ 
+
+  data_test_treat_boot <- data_test_boot
+  data_test_treat_boot$echo <- 1
+ 
+  data_test_ctrl_boot <- data_test_boot
+  data_test_ctrl_boot$echo <- 0
+ 
+  muhat.treat_boot <- predict(random_forest_model_boot, newdata = data_test_treat_boot, type = "prob")[, "1"]
+  muhat.ctrl_boot <- predict(random_forest_model_boot, newdata = data_test_ctrl_boot, type = "prob")[, "1"]
+ 
+
+  ate_est_boot <- mean(muhat.treat_boot) - mean(muhat.ctrl_boot)
+ 
+
+  ate_estimates[i] <- ate_est_boot
+}
+
+
+se_ate <- sd(ate_estimates)
+
+
+ci_95 <- quantile(ate_estimates, c(0.025, 0.975))
+
+
+mean_ate <- mean(ate_estimates)
+
+
+
+cat("Mean ATE:", mean_ate, "\n")
+cat("Standard error of ATE estimates:", se_ate, "\n")
+cat("95% Confidence Interval for ATE:", ci_95[1], "to", ci_95[2], "\n")
+```
+
+```{r}
+plot(sensitivity, 
+     sensitivity.of = "t-value", 
+     labels_args = list(adj = c(6.5, 6.5))) # Adjust these parameters as needed
+
+```
+
+```{r}
+library(MatchIt)
+library(cobalt)
+
+
+matchit_obj = matchit(echo ~ age + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy, data = imp_data, method = "nearest", distance = "randomforest", exact = "icd_chf")
+
+var_names = c(age = "Age", weight = "Weight", saps = "SAPS", sofa = "SOFA", elix_score = "Elix Score", vent =  "Ventilation", vaso = "Vasopressor", icd_chf = "Chronic Heart Failure", icd_afib = "Atrial Fibrillation", icd_copd = "COPD", icd_cad = "Coronary Artery Disease", icd_stroke = "Stroke", icd_malignancy = "Malignant Neoplasm", icd_liver = "Liver Disease", icu_adm_weekday = "ICU Weekday", icu_adm_hour = "ICU Hour")
+love.plot(matchit_obj,
+          var.names = var_names,
+   var.order = "adjusted",
+          colors = list(unadjusted = "orange", adjusted = "blue"),
+          abs = T)
+```
+```{r}
+echo ~ age + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy
+
+echo ~ age + weight + saps + sofa + elix_score + icd_chf + icd_afib + icd_copd + icd_cad + icd_stroke + icd_malignancy
+```
+
+```{r}
+library(optmatch)
+matchit_obj = matchit(echo ~ age + saps + sofa + elix_score + icu_adm_weekday + icd_chf + icd_liver + icd_copd + icd_cad + icd_stroke + icd_malignancy, data = imp_data, method = "full", distance = "randomforest", caliper = .4)
+
+var_names = c(age = "Age", weight = "Weight", saps = "SAPS", sofa = "SOFA", elix_score = "Elix Score", vent =  "Ventilation", vaso = "Vasopressor", icd_chf = "Chronic Heart Failure", icd_afib = "Atrial Fibrillation", icd_copd = "COPD", icd_cad = "Coronary Artery Disease", icd_stroke = "Stroke", icd_malignancy = "Malignant Neoplasm", icd_renal = "Renal Insufficiency", icd_liver = "Liver Disease", sedative = "Sedative", vs_heart_rate_first = "first heart rate vital sign", icu_adm_weekday = "ICU Weekday", icd_stroke = "Stroke")
+love.plot(matchit_obj,
+          var.names = var_names,
+          var.order = "adjusted",
+          colors = list(unadjusted = "orange", adjusted = "blue"),
+          abs = T)
+bal.tab(matchit_obj)
+matched_data = match.data(matchit_obj)
+```
+
+```{r}
+(
+  imp_data
+  %>% group_by(deathtime)
+  %>% summarise(n())
+)
+```
+```{r}
+library(readr)
+data_sepsis <- read_csv("Desktop/data_sepsis.csv")
+```
+```{r}
+
+```
+
